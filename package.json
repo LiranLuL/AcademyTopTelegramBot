@@ -1,0 +1,8 @@
+{
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "lowdb": "^7.0.1",
+    "lowdb-session-store": "^1.1.1",
+    "node-telegram-bot-api": "^0.66.0"
+  }
+}
