@@ -1,276 +1,466 @@
-const TelegramBot = require("node-telegram-bot-api");
-const fs = require("fs");
+try {
+  const TelegramBot = require("node-telegram-bot-api");
+  const fs = require("fs");
+  const sqlite3 = require("sqlite3").verbose();
+  require("dotenv").config();
 
-//Инициализируем переменные из .env
-require("dotenv").config();
+  // Инициализация бота
+  const bot = new TelegramBot(process.env.API_KEY, { polling: true });
+  const db = new sqlite3.Database("./tasks.db");
 
-//Инициализируем бота
-const bot = new TelegramBot(process.env.API_KEY, {
-  polling: true,
-});
+  // Создаем таблицы
+  db.serialize(() => {
+    db.run(`CREATE TABLE IF NOT EXISTS tasks (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      chatId INTEGER,
+      title TEXT,
+      description TEXT,
+      deadline TEXT,
+      executor TEXT CHECK(executor IN ('МУП', 'МОП', 'Директор', 'Колледж')),
+      status TEXT DEFAULT 'Новая',
+      photos TEXT DEFAULT '[]',
+      createdAt DATETIME DEFAULT CURRENT_TIMESTAMP
+    )`);
+  });
 
-//Массив с объектами для меню команд
-const commands = [
-  { command: "start", description: "Запуск бота" },
-  { command: "ref", description: "Получить реферальную ссылку" },
-  { command: "help", description: "Раздел помощи" },
-  { command: "link", description: "Ссылка" },
-  { command: "menu", description: "Меню-клавиатура" },
-  { command: "second_menu", description: "Второе меню" },
-];
+  // Состояния пользователей
+  const userStates = {};
+  const Executors = ["МУП", "МОП", "Директор", "Колледж"];
 
-//Устанавливаем меню команд
-bot.setMyCommands(commands);
+  // Обновленные команды
+  const commands = [
+    { command: "start", description: "Запуск бота" },
+    { command: "newtask", description: "Создать новую задачу" },
+    { command: "alltasks", description: "Все задачи" },
+    { command: "categorytasks", description: "Задачи по исполнителям" },
+  ];
 
-//Слушатель для текстового сообщения
-bot.on("text", async (msg) => {
-  try {
-    //Обрабатываем запуск бота
-    if (msg.text.startsWith("/start")) {
-      await bot.sendMessage(msg.chat.id, `Меню бота`, {
-        reply_markup: {
-          //Добавляем пользователю меню-клавиатуру
-          keyboard: [
-            ["Добавить задачу", "Вывести список задач"],
-            ["Отметить выполнение", "Разбить задачу на шаги"],
-            ["Вывести список сделанных задач"],
-          ],
-          //Подгоняем размер меню-клавиатуры
-          resize_keyboard: true,
-        },
-      });
-    } else if (msg.text == "/menu") {
-      await bot.sendMessage(msg.chat.id, `Меню бота`, {
-        reply_markup: {
-          //Добавляем пользователю меню-клавиатуру
-          keyboard: [
-            ["Добавить задачу", "Вывести список задач"],
-            ["Отметить выполнение", "Разбить задачу на шаги"],
-            ["Вывести список сделанных задач"],
-          ],
-          //Подгоняем размер меню-клавиатуры
-          resize_keyboard: true,
-        },
-      });
-    } else if (msg.text == "⭐️ Голосовое сообщение") {
-      //Скидываем голосовое сообщение
-      await bot.sendVoice(msg.chat.id, "./audio.mp3", {
-        caption: "<b>⭐️ Голосовое сообщение</b>",
-        parse_mode: "HTML",
-      });
-    } else {
-      await bot.sendMessage(msg.chat.id, `Неверная команда`);
+  bot.setMyCommands(commands);
+
+  // Добавляем константы для календаря
+  const monthNames = ["Январь", "Февраль", "Март", "Апрель", "Май", "Июнь", "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь"];
+
+  const dayNames = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"];
+
+  // Добавляем обработчик для фото
+  bot.on("photo", async (msg) => {
+    const chatId = msg.chat.id;
+    const state = userStates[chatId];
+
+    if (state?.step === "photo") {
+      try {
+        // Получаем file_id самого большого варианта фото
+        const photo = msg.photo[msg.photo.length - 1];
+        state.data.photos = state.data.photos || [];
+        state.data.photos.push(photo.file_id);
+
+        await bot.sendMessage(chatId, 'Фото добавлено! Отправьте еще или нажмите "Готово"', {
+          reply_markup: {
+            keyboard: [["Готово"]],
+            resize_keyboard: true,
+          },
+        });
+      } catch (error) {
+        console.error("Error processing photo:", error);
+        await bot.sendMessage(chatId, "Ошибка при обработке фото");
+      }
     }
-  } catch (error) {
-    console.log(error);
+  });
+  // Обработчики сообщений
+  bot.on("text", async (msg) => {
+    const chatId = msg.chat.id;
+    const text = msg.text;
+
+    try {
+      if (text.startsWith("/start" || text === "🏠 Главное меню")) {
+        await showMainMenu(chatId);
+      } else if (text === "📝 Создать задачу" || text === "/newtask") {
+        await startTaskCreation(chatId);
+      } else if (text === "🌐 Все задачи" || text === "/alltasks") {
+        await showAllTasks(chatId);
+      } else if (text === "🆘 Помощь") {
+        await showHelp(chatId);
+      } else if (text === "👥 Задачи по исполнителю" || text === "/categorytasks") {
+        await showExecutorFilterMenu(chatId);
+      } else if (userStates[chatId]?.step) {
+        await handleTaskState(chatId, text);
+      } else {
+        await bot.sendMessage(chatId, "Несуществующая команда");
+        await showMainMenu(chatId);
+      }
+    } catch (error) {
+      console.error(error);
+      await bot.sendMessage(chatId, "Ошибка обработки запроса");
+    }
+  });
+
+  // Логика создания задачи
+  async function startTaskCreation(chatId) {
+    userStates[chatId] = {
+      step: "title",
+      data: {},
+    };
+    await bot.sendMessage(chatId, "Введите название задачи:");
   }
-});
+  async function showHelp(chatId) {
+    await bot.sendMessage(
+      chatId,
+      `🆘 Справка:\n\n1. Создание задачи - используйте кнопку "📝 Создать задачу"\n2. Просмотр задач - "🌐 Все задачи"\n3. Завершение задач - "✅ Завершить задачу"`,
+      {
+        parse_mode: "Markdown",
+      }
+    );
+  }
 
-// //Обрабатываем сообщение с картинкой от пользователя
-// bot.on("photo", async (img) => {
-//   try {
-//     //Массив, в который затащим все варианты картинок
-//     const photoGroup = [];
-//     //Перебираем все варианты картинок (сжатые и оригинал) и добавляем информацию о них в массив
-//     for (let index = 0; index < img.photo.length; index++) {
-//       //Скачиваем картинку
-//       const photoPath = await bot.downloadFile(img.photo[index].file_id, "./image");
-//       //Добавляем информацию о картинке в массив используя путь до картинки и информацию о вариантах из img
-//       photoGroup.push({
-//         type: "photo",
-//         media: photoPath,
-//         caption: `Размер файла: ${img.photo[index].file_size} байт\nШирина: ${img.photo[index].width}\nВысота: ${img.photo[index].height}`,
-//       });
-//     }
-//     //Отправляем пользователю все варианты картинок
-//     await bot.sendMediaGroup(img.chat.id, photoGroup);
-//     //Перебираем и удаляем все картинки, которые скачали
-//     for (let index = 0; index < photoGroup.length; index++) {
-//       fs.unlink(photoGroup[index].media, (error) => {
-//         if (error) {
-//           console.log(error);
-//         }
-//       });
-//     }
-//   } catch (error) {
-//     console.log(error);
-//   }
-// });
+  // Меню выбора исполнителя для фильтрации
+  async function showExecutorFilterMenu(chatId) {
+    await bot.sendMessage(chatId, "Выберите исполнителя:", {
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: "МУП", callback_data: "filter_МУП" }],
+          [{ text: "МОП", callback_data: "filter_МОП" }],
+          [{ text: "Директор", callback_data: "filter_Директор" }],
+          [{ text: "Колледж", callback_data: "filter_Колледж" }],
+        ],
+      },
+    });
+  }
 
-// //Обрабатываем сообщение с видео от пользователя
-// bot.on("video", async (video) => {
-//   try {
-//     //Скачиваем миниатюру видео
-//     const thumbPath = await bot.downloadFile(video.video.thumbnail.file_id, "./image");
-//     //Скидываем пользователю видео с информацией о нём и миниатюру
-//     await bot.sendMediaGroup(video.chat.id, [
-//       {
-//         type: "video",
-//         media: video.video.file_id,
-//         caption: `Название файла: ${video.video.file_name}\nВес файла: ${video.video.file_size} байт\nДлительность видео: ${video.video.duration} секунд\nШирина кадра в видео: ${video.video.width}\nВысота кадра в видео: ${video.video.height}`,
-//       },
-//       {
-//         type: "photo",
-//         media: thumbPath,
-//       },
-//     ]);
-//     //Удаляем миниатюру
-//     fs.unlink(thumbPath, (error) => {
-//       if (error) {
-//         console.log(error);
-//       }
-//     });
-//   } catch (error) {
-//     console.log(error);
-//   }
-// });
+  async function handleTaskState(chatId, text) {
+    const state = userStates[chatId];
 
-// //Обрабатываем сообщение с аудио от пользователя
-// bot.on("audio", async (audio) => {
-//   try {
-//     //Скидываем пользователю аудио и информацию об аудио
-//     await bot.sendAudio(audio.chat.id, audio.audio.file_id, {
-//       caption: `Название файла: ${audio.audio.file_name}\nВес файла: ${audio.audio.file_size} байт\nДлительность аудио: ${audio.audio.duration} секунд`,
-//     });
-//   } catch (error) {
-//     console.log(error);
-//   }
-// });
+    switch (state.step) {
+      case "title":
+        state.data.title = text;
+        state.step = "description";
+        await bot.sendMessage(chatId, "Введите подробное описание задачи:");
+        break;
 
-// //Обрабатываем голосовое сообщение от ползователя
-// bot.on("voice", async (voice) => {
-//   try {
-//     //Скидываем пользователю его голосовое сообщение аудио-файлом и пишем информацию о нем
-//     await bot.sendAudio(voice.chat.id, voice.voice.file_id, {
-//       caption: `Вес файла: ${voice.voice.file_size} байт\nДлительность аудио: ${voice.voice.duration} секунд`,
-//     });
-//   } catch (error) {
-//     console.log(error);
-//   }
-// });
+      case "description":
+        state.data.description = text;
+        state.step = "deadline";
+        await sendCalendar(chatId); // Отправляем календарь вместо запроса ручного ввода
+        break;
 
-// //Обрабатываем сообщение с контактом от пользователя
-// bot.on("contact", async (contact) => {
-//   try {
-//     //Скидываем пользователю информацию о контакте
-//     await bot.sendMessage(contact.chat.id, `Номер контакта: ${contact.contact.phone_number}\nИмя контакта: ${contact.contact.first_name}`);
-//   } catch (error) {
-//     console.log(error);
-//   }
-// });
+      // case "deadline":
+      //   if (!isValidDate(text)) {
+      //     return await bot.sendMessage(chatId, "Неверный формат даты! Используйте ДД.ММ.ГГГГ");
+      //   }
+      //   state.data.deadline = text;
+      //   state.step = "executor";
+      //   await bot.sendMessage(chatId, "Выберите исполнителя:", {
+      //     reply_markup: {
+      //       keyboard: [Executors],
+      //       resize_keyboard: true,
+      //     },
+      //   });
+      //   break;
 
-// //Обрабатываем сообщение с геолокацией от пользователя
-// bot.on("location", async (location) => {
-//   try {
-//     //Отправляем пользователю широту и долготу геолокации, которую он нам отправил
-//     await bot.sendMessage(location.chat.id, `Широта: ${location.location.latitude}\nДолгота: ${location.location.longitude}`);
-//   } catch (error) {
-//     console.log(error);
-//   }
-// });
+      case "executor":
+        if (!Executors.includes(text)) {
+          return await bot.sendMessage(chatId, "Выберите исполнителя из предложенных вариантов");
+        }
+        state.data.executor = text;
+        state.step = "photo";
+        await bot.sendMessage(chatId, "Отправьте фото для задачи (если нужно) или нажмите 'Готово'", {
+          reply_markup: {
+            keyboard: [["Готово"]],
+            resize_keyboard: true,
+          },
+        });
+        break;
 
-// //Обрабатываем сообщение со стикером от пользователя
-// bot.on("sticker", async (sticker) => {
-//   try {
-//     //Скачиваем файл стикера
-//     const stickerPath = await bot.downloadFile(sticker.sticker.file_id, "./image");
-//     //В зависимости от типа стикера скидываем пользователю файл с ним (видео, анимация или картинка)
-//     if (sticker.sticker.is_video) {
-//       await bot.sendVideo(sticker.chat.id, stickerPath);
-//     } else if (sticker.sticker.is_animated) {
-//       await bot.sendAnimation(sticker.chat.id, sticker.sticker.file_id);
-//     } else {
-//       await bot.sendPhoto(sticker.chat.id, stickerPath);
-//     }
-//     //Удаляем файл стикера
-//     fs.unlink(stickerPath, (error) => {
-//       if (error) {
-//         console.log(error);
-//       }
-//     });
-//   } catch (error) {
-//     console.log(error);
-//   }
-// });
+      case "photo":
+        if (text === "Готово") {
+          await saveTaskToDB(chatId, state.data);
+          delete userStates[chatId];
+          await bot.sendMessage(chatId, "Задача успешно создана!", {
+            reply_markup: { remove_keyboard: true },
+          });
+        }
+        break;
+    }
+  }
 
-// //Обрабатываем коллбеки на инлайн-клавиатуре
-// bot.on("callback_query", async (ctx) => {
-//   try {
-//     switch (ctx.data) {
-//       //Кнопка закрытия меню удаляет сообщение с меню и сообщение, по которому было вызвано меню
-//       case "closeMenu":
-//         await bot.deleteMessage(ctx.message.chat.id, ctx.message.message_id);
-//         await bot.deleteMessage(ctx.message.reply_to_message.chat.id, ctx.message.reply_to_message.message_id);
-//         break;
-//       //Кнопкой стикера скидываем пользователю картинку стикером
-//       case "sticker":
-//         await bot.sendSticker(ctx.message.chat.id, `./image.jpg`);
-//         break;
-//       //Отправляем пользователю круглое видео
-//       case "circleVideo":
-//         await bot.sendVideoNote(ctx.message.chat.id, "./video.mp4", {
-//           protect_content: true,
-//         });
-//         break;
-//       //Проверяем подписку пользователя на канал и отвечаем ему сообщением в зависимости от того, является ли он подписчиком канала
-//       case "checkSubs":
-//         const subscribe = await bot.getChatMember(process.env.ID_CHAT, ctx.from.id);
+  // // Валидация даты
+  // function isValidDate(dateString) {
+  //   const pattern = /^(\d{2})\.(\d{2})\.(\d{4})$/;
+  //   return pattern.test(dateString);
+  // }
+  // Добавляем функции для работы с календарем
+  async function sendCalendar(chatId, date = new Date()) {
+    const keyboard = generateCalendarKeyboard(date);
+    await bot.sendMessage(chatId, "Выберите дату выполнения:", {
+      reply_markup: {
+        inline_keyboard: keyboard,
+      },
+    });
+  }
+  function generateCalendarKeyboard(date = new Date()) {
+    const year = date.getFullYear();
+    const month = date.getMonth();
+    // Корректное определение последнего дня месяца
+    const lastDay = new Date(year, month + 1, 0);
+    const daysInMonth = lastDay.getDate();
 
-//         if (subscribe.status == "left" || subscribe.status == "kicked") {
-//           await bot.sendMessage(ctx.message.chat.id, `<b>Вы не являетесь подписчиком!</b>`, {
-//             parse_mode: "HTML",
-//           });
-//         } else {
-//           await bot.sendMessage(ctx.message.chat.id, "<b>Вы являетесь подписчиком!</b>", {
-//             parse_mode: "HTML",
-//           });
-//         }
+    // Получаем первый день месяца (с понедельника)
+    const firstDay = new Date(year, month, 1);
+    let startDay = firstDay.getDay() === 0 ? 6 : firstDay.getDay() - 1;
 
-//         break;
-//       //Отправляем пользователю счет на оплату
-//       case "buyFile":
-//         await bot.sendInvoice(
-//           ctx.message.chat.id,
-//           "Купить Файл", //Заголовок счета
-//           "Покупка файла", //Описание счета
-//           "file", //Payload - используем для того, чтобы отследить платеж, пользователю не отображается
-//           process.env.PROVIDER_TOKEN, //Провайдер-токен от платежки
-//           "RUB", //Код валюты
-//           [
-//             {
-//               label: "Файл", //Название товара
-//               amount: 20000, //Цена товара (в копейках!!!)
-//             },
-//           ]
-//         );
+    const keyboard = [];
 
-//         break;
-//     }
-//   } catch (error) {
-//     console.log(error);
-//   }
-// });
+    // Шапка с месяцем и годом
+    keyboard.push([
+      {
+        text: `${monthNames[month]} ${year}`,
+        callback_data: "ignore",
+      },
+    ]);
 
-// //Окончательно подтверждаем формирование заказа по счету при оплате
-// bot.on("pre_checkout_query", async (ctx) => {
-//   try {
-//     await bot.answerPreCheckoutQuery(ctx.id, true);
-//   } catch (error) {
-//     console.log(error);
-//   }
-// });
+    // Дни недели
+    keyboard.push(dayNames.map((day) => ({ text: day, callback_data: "ignore" })));
 
-// //Обрабатываем удачный платеж от пользователя
-// bot.on("successful_payment", async (ctx) => {
-//   try {
-//     //Отправляем пользователю документ и выводим информацию в зависимости от payload из платежа
-//     await bot.sendDocument(ctx.chat.id, `./${ctx.successful_payment.invoice_payload}.txt`, {
-//       caption: `Спасибо за оплату ${ctx.successful_payment.invoice_payload}!`,
-//     });
-//   } catch (error) {
-//     console.log(error);
-//   }
-// });
+    // Ячейки календаря
+    let week = [];
+    // Добавляем пустые ячейки для первого ряда
+    for (let i = 0; i < startDay; i++) {
+      week.push({ text: " ", callback_data: "ignore" });
+    }
 
-//Ловим ошибки polling'a
-bot.on("polling_error", (err) => console.log(err.data.error.message));
+    for (let day = 1; day <= daysInMonth; day++) {
+      const callbackData = `date_${year}-${String(month + 1).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+      week.push({ text: String(day), callback_data: callbackData });
+
+      if (week.length === 7) {
+        keyboard.push(week);
+        week = [];
+      }
+    }
+
+    // Добавляем оставшиеся дни
+    if (week.length > 0) {
+      while (week.length < 7) {
+        week.push({ text: " ", callback_data: "ignore" });
+      }
+      keyboard.push(week);
+    }
+
+    // Кнопки навигации
+    keyboard.push([
+      {
+        text: "◀️",
+        callback_data: `prevmonth_${year}-${month}`,
+      },
+      {
+        text: "▶️",
+        callback_data: `nextmonth_${year}-${month}`,
+      },
+    ]);
+
+    return keyboard;
+  }
+
+  // Сохранение в БД
+  function saveTaskToDB(chatId, taskData) {
+    return new Promise((resolve, reject) => {
+      db.run(
+        `INSERT INTO tasks (chatId, title, description, deadline, executor, photos) 
+         VALUES (?, ?, ?, ?, ?, ?)`,
+        [chatId, taskData.title, taskData.description, taskData.deadline, taskData.executor, JSON.stringify(taskData.photos || [])],
+        (err) => {
+          if (err) reject(err);
+          else resolve();
+        }
+      );
+    });
+  }
+
+  async function showAllTasks(chatId) {
+    db.all("SELECT * FROM tasks ORDER BY deadline", async (err, tasks) => {
+      if (err) {
+        console.error(err);
+        return await bot.sendMessage(chatId, "Ошибка получения задач");
+      }
+
+      if (tasks.length === 0) {
+        return await bot.sendMessage(chatId, "Нет задач в системе");
+      }
+
+      for (const task of tasks) {
+        // Отправляем фото если есть
+        const photos = JSON.parse(task.photos || "[]");
+        if (photos.length > 0) {
+          await bot.sendMediaGroup(
+            chatId,
+            photos.map((photo_id) => ({
+              type: "photo",
+              media: photo_id,
+            }))
+          );
+        }
+
+        // Отправляем информацию о задаче
+        await bot.sendMessage(chatId, formatTask(task), createTaskKeyboard(task));
+      }
+    });
+  }
+
+  // Меню
+  async function showMainMenu(chatId) {
+    await bot.sendMessage(chatId, "🏠 Главное меню:", {
+      reply_markup: {
+        keyboard: [["📝 Создать задачу", "👥 Задачи по исполнителю"], ["🌐 Все задачи"]],
+        resize_keyboard: true,
+      },
+    });
+  }
+
+  bot.on("callback_query", async (query) => {
+    const chatId = query.message.chat.id;
+    const data = query.data;
+    const messageId = query.message.message_id;
+
+    try {
+      // Обработка изменения статуса
+      if (data.startsWith("status_")) {
+        const [action, taskId, newStatus, executor] = data.split("_");
+        await updateTaskStatus(taskId, newStatus);
+        await bot.answerCallbackQuery(query.id, { text: "Статус обновлен!" });
+        await bot.deleteMessage(chatId, messageId);
+        await showTasksByExecutor(chatId, executor);
+      }
+
+      // Обработка удаления задачи
+      if (data.startsWith("delete_")) {
+        const taskId = data.split("_")[1];
+        const executor = data.split("_")[2];
+        await deleteTask(taskId);
+        await bot.answerCallbackQuery(query.id, { text: "Задача удалена!" });
+        await bot.deleteMessage(chatId, messageId);
+        await showTasksByExecutor(chatId, executor);
+      }
+
+      // Фильтрация по исполнителям
+      if (data.startsWith("filter_")) {
+        const executor = data.split("_")[1];
+        await showTasksByExecutor(chatId, executor);
+      }
+
+      // Обработка выбора даты
+      if (data.startsWith("date_")) {
+        const selectedDate = data.split("_")[1];
+        const [year, month, day] = selectedDate.split("-");
+
+        // Сохраняем дату в формате ДД.ММ.ГГГГ
+        userStates[chatId].data.deadline = `${day}.${month}.${year}`;
+
+        // Удаляем сообщение с календарем
+        await bot.deleteMessage(chatId, messageId);
+
+        // Переходим к выбору исполнителя
+        userStates[chatId].step = "executor";
+        await bot.sendMessage(chatId, "Выберите исполнителя:", {
+          reply_markup: {
+            keyboard: [Executors],
+            resize_keyboard: true,
+          },
+        });
+      }
+
+      if (data.startsWith("prevmonth_") || data.startsWith("nextmonth_")) {
+        const [action, params] = data.split("_");
+        const [yearStr, monthStr] = params.split("-");
+        const year = parseInt(yearStr);
+        const month = parseInt(monthStr);
+        let newDate = new Date(year, month);
+
+        if (action === "prevmonth") {
+          newDate.setMonth(newDate.getMonth() - 1);
+        } else {
+          newDate.setMonth(newDate.getMonth() + 1);
+        }
+        // Обновляем календарь
+        try {
+          await bot.editMessageReplyMarkup(
+            {
+              inline_keyboard: generateCalendarKeyboard(newDate),
+            },
+            {
+              chat_id: chatId,
+              message_id: messageId,
+            }
+          );
+        } catch (e) {
+          console.error("Error updating calendar:", e);
+        }
+      }
+    } catch (error) {
+      console.error(error);
+      await bot.answerCallbackQuery(query.id, { text: "Ошибка операции!" });
+    }
+  });
+
+  // Функция обновления статуса задачи
+  async function updateTaskStatus(taskId, newStatus) {
+    return new Promise((resolve, reject) => {
+      db.run("UPDATE tasks SET status = ? WHERE id = ?", [newStatus, taskId], (err) => (err ? reject(err) : resolve()));
+    });
+  }
+  // Функция удаления задачи
+  async function deleteTask(taskId) {
+    return new Promise((resolve, reject) => {
+      db.run("DELETE FROM tasks WHERE id = ?", [taskId], (err) => (err ? reject(err) : resolve()));
+    });
+  }
+
+  // Функция вывода задач по исполнителю
+  async function showTasksByExecutor(chatId, executor) {
+    db.all("SELECT * FROM tasks WHERE executor = ? ORDER BY deadline", [executor], async (err, tasks) => {
+      if (err) {
+        console.error(err);
+        return await bot.sendMessage(chatId, "Ошибка получения задач");
+      }
+
+      if (tasks.length === 0) {
+        return await bot.sendMessage(chatId, `Нет задач для исполнителя ${executor}`);
+      }
+
+      for (const task of tasks) {
+        await bot.sendMessage(chatId, formatTask(task), createTaskKeyboard(task));
+      }
+    });
+  }
+
+  // Функция для создания inline-клавиатуры
+  function createTaskKeyboard(task) {
+    return {
+      reply_markup: {
+        inline_keyboard: [
+          [
+            { text: "✅ Завершить", callback_data: `status_${task.id}_Завершена_${task.executor}` },
+            { text: "✏️ В работе", callback_data: `status_${task.id}_В работе__${task.executor}` },
+          ],
+          [{ text: "❌ Удалить", callback_data: `delete_${task.id}_${task.executor}` }],
+        ],
+      },
+    };
+  }
+
+  // Функция отображения задач
+  function formatTask(task) {
+    let text = `
+    🔹 ${task.title}
+    📅 Срок: ${task.deadline}
+    👤 Исполнитель: ${task.executor}
+    📝 Описание: ${task.description}
+    🔄 Статус: ${task.status}
+    📸 Фото: ${JSON.parse(task.photos).length} шт.
+    
+    [ID: ${task.id}]
+        `.trim();
+
+    return text;
+  }
+} catch (e) {
+  console.log(e);
+}
